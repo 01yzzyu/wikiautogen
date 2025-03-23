@@ -1,0 +1,607 @@
+import concurrent.futures
+import logging
+import os
+from concurrent.futures import as_completed
+from typing import Union, List, Tuple, Optional, Dict
+from openai import OpenAI, OpenAIError
+import dspy
+from .callback import BaseCallbackHandler
+from .persona_generator import PersonaGenerator
+from .wikiautogen_dataclass import DialogueTurn, InformationTableGen
+from ...interface import KnowledgeExplorationModule, Retriever, Information
+from ...utils import ArticleTextProcessing
+from ...lm import OpenAIModel
+
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx
+    streamlit_connection = True
+except ImportError as err:
+    streamlit_connection = False
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_KEY"
+os.environ["OPENAI_ENDPOINT"] = "https://api.openai.com/v1"
+
+class WikiWriter(dspy.Module):
+    """Perspective-guided question asking in conversational setup.
+
+    The asked question will be used to start a next round of information seeking."""
+
+    def __init__(self, engine: Union[dspy.dsp.LM, dspy.dsp.HFModel]):
+        super().__init__()
+        self.ask_question_with_persona = dspy.ChainOfThought(AskQuestionWithPersona)
+        self.ask_question = dspy.ChainOfThought(AskQuestion)
+        self.engine = engine
+
+    def forward(
+        self,
+        topic: str,
+        proposal: str,
+        persona: str,
+        dialogue_turns: List[DialogueTurn],
+        draft_page=None,
+    ):
+        conv = []
+        for turn in dialogue_turns[:-4]:
+            conv.append(
+                f"You: {turn.user_utterance}\nExpert: omit the answer here due to space limit."
+            )
+        for turn in dialogue_turns[-4:]:
+            conv.append(
+                f"You: {turn.user_utterance}\nExpert: {ArticleTextProcessing.remove_citations(turn.agent_utterance)}"
+            )
+        conv = "\n".join(conv)
+        conv = conv.strip() or "N/A"
+        conv = ArticleTextProcessing.limit_word_count_preserve_newline(conv, 3500)
+
+        with dspy.settings.context(lm=self.engine):
+            if persona is not None and len(persona.strip()) > 0:
+                question = self.ask_question_with_persona(
+                    topic=topic,
+                    proposal=proposal,
+                    persona=persona,
+                    conv=conv
+                ).question
+            else:
+                question = self.ask_question(
+                    topic=topic,
+                    proposal=proposal,
+                    persona=persona,
+                    conv=conv
+                ).question
+
+        return dspy.Prediction(question=question)
+
+class AskQuestion(dspy.Signature):
+    """You are an experienced Wikipedia writer. You are chatting with an expert to get information for the topic you want to contribute. Ask good questions to get more useful information relevant to the topic.
+    When you have no more question to ask, say "Thank you so much for your help!" to end the conversation.
+    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the topic you want to write.
+    """
+    topic = dspy.InputField(prefix="Topic you want to write: ", format=str)
+    proposal = dspy.InputField(prefix="Proposal for research: ", format=str)
+    conv = dspy.InputField(prefix="Conversation history:\n", format=str)
+    question = dspy.OutputField(format=str)
+
+class AskQuestionWithPersona(dspy.Signature):
+    """You are an experienced Wikipedia writer and want to edit a specific page. Besides your identity as a Wikipedia writer, you have specific focus when researching the topic.
+    Now, you are chatting with an expert to get information. Ask good questions to get more useful information.
+    When you have no more question to ask, say "Thank you so much for your help!" to end the conversation.
+    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the topic you want to write.
+    """
+
+    topic = dspy.InputField(prefix="Topic you want to write: ", format=str)
+    proposal = dspy.InputField(prefix="Proposal for research: ", format=str)
+    persona = dspy.InputField(
+        prefix="Your persona besides being a Wikipedia writer: ", format=str
+    )
+    conv = dspy.InputField(prefix="Conversation history:\n", format=str)
+    question = dspy.OutputField(format=str)
+
+class QuestionToQuery(dspy.Signature):
+    """You want to answer the question using Google search. What do you type in the search box?
+    Write the queries you will use in the following format:
+    - query 1
+    - query 2
+    ...
+    - query n"""
+    topic = dspy.InputField(prefix="Topic you are discussing about: ", format=str)
+    proposal = dspy.InputField(prefix="Proposal for research: ", format=str)
+    question = dspy.InputField(prefix="Question you want to answer: ", format=str)
+    queries = dspy.OutputField(format=str)
+
+class AnswerQuestion(dspy.Signature):
+    """You are an expert who can use information effectively. You are chatting with a Wikipedia writer who wants to write a Wikipedia page on topic you know. You have gathered the related information and will now use the information to form a response.
+    Make your response as informative as possible, ensuring that every sentence is supported by the gathered information. If the [gathered information] is not directly related to the [topic] or [question], provide the most relevant answer based on the available information. If no appropriate answer can be formulated, respond with, “I cannot answer this question based on the available information,” and explain any limitations or gaps.
+    """
+    topic = dspy.InputField(prefix="Topic you are discussing about:", format=str)
+    proposal = dspy.InputField(prefix="Proposal for research: ", format=str)
+    conv = dspy.InputField(prefix="Question:\n", format=str)
+    info = dspy.InputField(prefix="Gathered information:\n", format=str)
+    answer = dspy.OutputField(
+        prefix="Now give your response. (Try to use as many different sources as possible and add do not hallucinate.)\n",
+        format=str,
+    )
+
+class TopicExpert(dspy.Module):
+    """Answer questions using search-based retrieval and answer generation. This module conducts the following steps:
+    1. Generate queries from the question.
+    2. Search for information using the queries.
+    3. Filter out unreliable sources.
+    4. Generate an answer using the retrieved information.
+    """
+    def __init__(
+        self,
+        engine: Union[dspy.dsp.LM, dspy.dsp.HFModel],
+        max_search_queries: int,
+        search_top_k: int,
+        retriever: Retriever,
+    ):
+        super().__init__()
+        self.generate_queries = dspy.Predict(QuestionToQuery)
+        self.retriever = retriever
+        self.answer_question = dspy.Predict(AnswerQuestion)
+        self.engine = engine
+        self.max_search_queries = max_search_queries
+        self.search_top_k = search_top_k
+
+    def forward(self, topic: str, proposal: str, question: str, ground_truth_url: str):
+        with dspy.settings.context(lm=self.engine, show_guidelines=False):
+            # Identify: Break down question into queries.
+            queries = self.generate_queries(
+                topic=topic,
+                proposal=proposal,
+                question=question
+            ).queries
+            queries = [
+                q.replace("-", "").strip().strip('"').strip('"').strip()
+                for q in queries.split("\n")
+            ]
+            queries = queries[: self.max_search_queries]
+            # Search
+            searched_results: List[Information] = self.retriever.retrieve(
+                list(set(queries)), exclude_urls=[ground_truth_url]
+            )
+            if len(searched_results) > 0:
+                # Evaluate: Simplify this part by directly using the top 1 snippet.
+                info = ""
+                for n, r in enumerate(searched_results):
+                    info += "\n".join(f"[{n + 1}]: {s}" for s in r.snippets[:1])
+                    info += "\n\n"
+
+                info = ArticleTextProcessing.limit_word_count_preserve_newline(
+                    info, 3000
+                )
+
+                try:
+                    answer = self.answer_question(
+                        topic=topic,
+                        proposal=proposal,
+                        conv=question,
+                        info=info
+                    ).answer
+                    answer = ArticleTextProcessing.remove_uncompleted_sentences_with_citations(
+                        answer
+                    )
+                except Exception as e:
+                    logging.error(f"Error occurs when generating answer: {e}")
+                    answer = "Sorry, I cannot answer this question. Please ask another question."
+            else:
+                # When no information is found, the expert shouldn't hallucinate.
+                answer = "Sorry, I cannot find information for this question. Please ask another question."
+
+        return dspy.Prediction(
+            queries=queries, searched_results=searched_results, answer=answer
+        )
+
+class KnowledgeExplorationModule(KnowledgeExplorationModule):
+    """
+    The interface for knowledge curation stage. Given topic, return collected information.
+    """
+
+    def __init__(
+        self,
+        retriever: Retriever,
+        persona_generator: Optional[PersonaGenerator],
+        conv_simulator_lm: Union[dspy.dsp.LM, dspy.dsp.HFModel],
+        question_asker_lm: Union[dspy.dsp.LM, dspy.dsp.HFModel],
+        max_search_queries_per_turn: int,
+        search_top_k: int,
+        max_conv_turn: int,
+        max_thread_num: int,
+        monitor_engine: Union[dspy.dsp.LM, dspy.dsp.HFModel]
+    ):
+        """
+        Store args and finish initialization.
+        """
+        self.retriever = retriever
+        self.persona_generator = persona_generator
+        self.conv_simulator_lm = conv_simulator_lm
+        self.search_top_k = search_top_k
+        self.max_thread_num = max_thread_num
+        self.retriever = retriever
+        self.conv_simulator = ConvSimulator(
+            topic_expert_engine=conv_simulator_lm,
+            question_asker_engine=question_asker_lm,
+            retriever=retriever,
+            max_search_queries_per_turn=max_search_queries_per_turn,
+            search_top_k=search_top_k,
+            max_turn=max_conv_turn,
+            monitor_engine=question_asker_lm
+        )
+
+    def _get_considered_personas(self, topic: str, max_num_persona) -> List[str]:
+        return self.persona_generator.generate_persona(
+            topic=topic, max_num_persona=max_num_persona
+        )
+
+    def _run_conversation(
+        self,
+        conv_simulator,
+        topic: str,
+        proposal: str,
+        ground_truth_url: str,
+        considered_personas,
+        callback_handler: BaseCallbackHandler,
+    ) -> List[Tuple[str, List[DialogueTurn]]]:
+        """
+        Executes multiple conversation simulations concurrently, each with a different persona,
+        and collects their dialog histories. The dialog history of each conversation is cleaned
+        up before being stored.
+
+        Parameters:
+            conv_simulator (callable): The function to simulate conversations. It must accept four
+                parameters: `topic`, `proposal`, `ground_truth_url`, `persona`, and `callback_handler`, and return
+                an object that has a `dlg_history` attribute.
+            topic (str): The topic of conversation for the simulations.
+            proposal (str): The research proposal.
+            ground_truth_url (str): The URL to the ground truth data related to the conversation topic.
+            considered_personas (list): A list of personas under which the conversation simulations
+                will be conducted. Each persona is passed to `conv_simulator` individually.
+            callback_handler (callable): A callback function that is passed to `conv_simulator`. It
+                should handle any callbacks or events during the simulation.
+
+        Returns:
+            list of tuples: A list where each tuple contains a persona and its corresponding cleaned
+            dialog history (`dlg_history`) from the conversation simulation.
+        """
+
+        conversations = []
+
+        def run_conv(persona):
+            return conv_simulator(
+                topic=topic,
+                proposal=proposal,
+                ground_truth_url=ground_truth_url,
+                persona=persona,
+                callback_handler=callback_handler,
+            )
+
+        max_workers = min(self.max_thread_num, len(considered_personas))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_persona = {
+                executor.submit(run_conv, persona): persona
+                for persona in considered_personas
+            }
+
+            if streamlit_connection:
+                # Ensure the logging context is correct when connecting with Streamlit frontend.
+                for t in executor._threads:
+                    add_script_run_ctx(t)
+
+            for future in as_completed(future_to_persona):
+                persona = future_to_persona[future]
+                conv = future.result()
+                conversations.append(
+                    (persona, ArticleTextProcessing.clean_up_citation(conv).dlg_history)
+                )
+
+        return conversations
+
+    def research(
+        self,
+        topic: str,
+        proposal: str,
+        ground_truth_url: str,
+        callback_handler: BaseCallbackHandler,
+        max_perspective: int = 0,
+        disable_perspective: bool = True,
+        return_conversation_log=False,
+    ) -> Union[InformationTableGen, Tuple[InformationTableGen, Dict]]:
+        """
+        Curate information and knowledge for the given topic
+
+        Args:
+            topic: topic of interest in natural language.
+            proposal: additional proposal for the research.
+
+        Returns:
+            collected_information: collected information in InformationTable type.
+        """
+
+        # identify personas
+        callback_handler.on_identify_perspective_start()
+        considered_personas = []
+        if disable_perspective:
+            considered_personas = [""]
+        else:
+            considered_personas = self._get_considered_personas(
+                topic=topic, max_num_persona=max_perspective
+            )
+        callback_handler.on_identify_perspective_end(perspectives=considered_personas)
+
+        # run conversation
+        callback_handler.on_information_gathering_start()
+        conversations = self._run_conversation(
+            conv_simulator=self.conv_simulator,
+            topic=topic,
+            proposal=proposal,
+            ground_truth_url=ground_truth_url,
+            considered_personas=considered_personas,
+            callback_handler=callback_handler,
+        )
+
+        information_table = InformationTableGen(conversations)
+        callback_handler.on_information_gathering_end()
+        if return_conversation_log:
+            return information_table, InformationTableGen.construct_log_dict(
+                conversations
+            )
+        return information_table
+
+class ConversationMonitor(dspy.Module):
+    def __init__(self, engine: Union[dspy.dsp.LM, dspy.dsp.HFModel]):
+        super().__init__()
+        self.monitor_dialogue = dspy.Predict(MonitorDialogue)
+        self.engine = engine
+
+    def forward(self, topic: str, proposal: str, dlg_turn: DialogueTurn):
+        with dspy.settings.context(lm=self.engine):
+            feedback = self.monitor_dialogue(
+                topic=topic,
+                proposal=proposal,
+                user_utterance=dlg_turn.user_utterance,
+                agent_utterance=dlg_turn.agent_utterance
+            ).feedback
+        return feedback
+
+class MonitorDialogue(dspy.Signature):
+    """You are a conversation monitor. Review the dialogue between the Wikipedia writer and the expert.
+    Provide feedback on the quality, relevance, and coherence of the dialogue. If there are any issues,
+    suggest improvements. If the dialogue is good, simply say 'The dialogue is appropriate.'"""
+
+    topic = dspy.InputField(prefix="Topic you are discussing about: ", format=str)
+    proposal = dspy.InputField(prefix="Proposal for research: ", format=str)
+    user_utterance = dspy.InputField(prefix="Wikipedia writer's utterance: ", format=str)
+    agent_utterance = dspy.InputField(prefix="Expert's response: ", format=str)
+    feedback = dspy.OutputField(format=str)
+
+class ConvSimulator(dspy.Module):
+    """Simulate a conversation between a Wikipedia writer with specific persona and an expert."""
+
+    def __init__(
+        self,
+        topic_expert_engine: Union[dspy.LM, dspy.HFModel],
+        question_asker_engine: Union[dspy.LM, dspy.HFModel],
+        retriever: Retriever,
+        max_search_queries_per_turn: int,
+        search_top_k: int,
+        max_turn: int,
+        monitor_engine: Union[dspy.LM, dspy.HFModel]
+    ):
+        super().__init__()
+        self.wiki_writer = WikiWriter(engine=question_asker_engine)
+        self.topic_expert = TopicExpert(
+            engine=topic_expert_engine,
+            max_search_queries=max_search_queries_per_turn,
+            search_top_k=search_top_k,
+            retriever=retriever,
+        )
+        self.max_turn = max_turn
+        self.conversation_monitor = ConversationMonitor(engine=monitor_engine)
+
+    def continue_dialogue(self, topic, proposal, persona, dlg_history, user_utterance, ground_truth_url, callback_handler):
+        expert_output = self.topic_expert(
+            topic=topic,
+            proposal=proposal,
+            question=user_utterance,
+            ground_truth_url=ground_truth_url
+        )
+        dlg_turn = DialogueTurn(
+            agent_utterance=expert_output.answer,
+            user_utterance=user_utterance,
+            search_queries=expert_output.queries,
+            search_results=expert_output.searched_results,
+        )
+        dlg_history.append(dlg_turn)
+        callback_handler.on_dialogue_turn_end(dlg_turn=dlg_turn)
+        return dlg_turn
+
+    def generate_reflection(self, topic, proposal, dlg_turn, feedback, pair_num=1, temperature=0.4, model='gpt-4o'):
+        try:
+            import os
+            from openai import OpenAI, OpenAIError
+            client = OpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                base_url=os.environ.get("OPENAI_ENDPOINT")
+            )
+
+            reflection_prompt = f"""From a Wikipedia writer's perspective, please conduct a detailed self - reflection on the dialogue in this passage according to the following information.
+                Key Dialogue Info
+                Topic: {topic}
+                Proposal: {proposal}
+                User's Statement: {dlg_turn.user_utterance}
+                Expert's Reply: {dlg_turn.agent_utterance}
+                Monitor's Feedback: {feedback}
+                Problem Analysis
+                Breadth: Ensure the dialogue comprehensively covers key aspects of the topic, without omitting key points or including irrelevant details.
+                Novelty: Check if the dialogue not only adheres to the user's intent but also effectively relates and expands on new content.
+                Attractiveness: Evaluate whether the dialogue is engaging, has a sound structure, and if real - life examples are used to enhance interest.
+                Verifiability: Make sure viewpoints are supported by evidence from sufficient and reliable sources.
+                Depth: Examine if the topic is explored in - depth rather than superficially.
+                Interactivity: Assess if the dialogue can stimulate user interest and encourage further communication.
+                Improvement
+                Expand: Conduct more research, add essential information, and eliminate irrelevancies.
+                New Perspectives: Dive deeper into research, explore new content related to the topic and user intent.
+                Interest: Employ storytelling techniques, real - life cases, and create suspense or pose questions.
+                Evidence: Provide reliable evidence, cross - reference from multiple sources, and cite authoritatively.
+                Deepen: Thoroughly analyze key points and sub - topics using cases and expert opinions.
+                Interact: Tailor the content according to user interests, add interactive elements, and guide user input.
+                Info Reliability
+                Source Evaluate: Screen the sources cited in the dialogue, prioritize authoritative ones, and be cautious of dubious sources.
+                Accuracy Verify: Check the logical consistency of the content, externally verify facts/data, and promptly review any doubts."""
+            if pair_num > 1:
+                response = client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": reflection_prompt
+                        }
+                    ],
+                    model=model,
+                    temperature=temperature,
+                    n=pair_num
+                )
+            else:
+                response = client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": reflection_prompt
+                        }
+                    ],
+                    model=model,
+                    temperature=temperature
+                )
+
+            res = [str(c.message.content) for c in response.choices]
+            return res
+        except OpenAIError as e:
+            print(f"An error occurred while making an OpenAI API request: {e}")
+            return []
+        except Exception as e:
+            print(f"An unknown error occurred: {e}")
+            return []
+
+    def forward(
+        self,
+        topic: str,
+        proposal: str,
+        persona: str,
+        ground_truth_url: str,
+        callback_handler: BaseCallbackHandler,
+    ):
+        """
+        topic: The topic to research.
+        proposal: Additional proposal related to the research.
+        persona: The persona of the Wikipedia writer.
+        ground_truth_url: The ground_truth_url will be excluded from search to avoid ground truth leakage in evaluation.
+        """
+        dlg_history: List[DialogueTurn] = []
+
+        for turn_num in range(self.max_turn):
+            user_utterance = self.wiki_writer(
+                topic=topic,
+                proposal=proposal,
+                persona=persona,
+                dialogue_turns=dlg_history
+            ).question
+            if user_utterance == "":
+                logging.error("Simulated Wikipedia writer utterance is empty.")
+                break
+            if user_utterance.startswith("Thank you so much for your help!"):
+                break
+            expert_output = self.topic_expert(
+                topic=topic,
+                proposal=proposal,
+                question=user_utterance,
+                ground_truth_url=ground_truth_url
+            )
+            dlg_turn = self.continue_dialogue(topic, proposal, persona, dlg_history, user_utterance, ground_truth_url,
+                                            callback_handler)
+
+            # 216 Update:monitor
+            feedback = self.conversation_monitor(
+                topic=topic,
+                proposal=proposal,
+                dlg_turn=dlg_turn
+            )
+            logging.info(f"Conversation monitor feedback: {feedback}")
+
+            reflections = self.generate_reflection(
+                topic=topic,
+                proposal=proposal,
+                dlg_turn=dlg_turn,
+                feedback=feedback
+            )
+
+            new_proposal = proposal
+            for reflection in reflections:
+                try:
+                    if reflection is None:
+                        logging.error("Reflection output not found in prediction.")
+                    else:
+                        logging.info(f"Self - reflection from gpt: {reflection}")
+
+                    if reflection and ("improve" in reflection.lower() or "issue" in reflection.lower()):
+                        if "Uncommon information" in reflection:
+                            new_proposal = f"{new_proposal} Look for uncommon information"
+                        if "Focus" in reflection:
+                            if "Initial goal" in reflection and "not tied back" in reflection:
+                                new_proposal = f"{new_proposal} Re-align with initial goal"
+                            if "Off - topic indicators" in reflection:
+                                new_proposal = f"{new_proposal} Remove off - topic content"
+                        if "Interest Level" in reflection:
+                            if "Audience appeal" in reflection and "too technical" in reflection:
+                                new_proposal = f"{new_proposal} Use more accessible language"
+                            if "Storytelling elements" in reflection:
+                                new_proposal = f"{new_proposal} Incorporate storytelling elements"
+                        if "Coherence and Organization" in reflection:
+                            if "Logical flow" in reflection and "disjointed" in reflection:
+                                new_proposal = f"{new_proposal} Improve logical flow"
+                            if "Transitional phrases" in reflection:
+                                new_proposal = f"{new_proposal} Use transitional phrases"
+                        if "Verifiability" in reflection:
+                            if "Citation sources" in reflection:
+                                new_proposal = f"{new_proposal} Emphasize citation sources"
+                            if "Fact - checking process" in reflection:
+                                new_proposal = f"{new_proposal} Mention fact - checking process"
+                        if "Consistency" in reflection:
+                            if "Term usage" in reflection:
+                                new_proposal = f"{new_proposal} Ensure consistent term usage"
+                            if "Idea consistency" in reflection:
+                                new_proposal = f"{new_proposal} Check idea consistency"
+                        if "Intent Alignment" in reflection:
+                            if "User's goals" in reflection and "not contributing" in reflection:
+                                new_proposal = f"{new_proposal} Refocus on user's goals"
+                            if "Feedback loop" in reflection:
+                                new_proposal = f"{new_proposal} Establish feedback loop"
+                        if "Repetition" in reflection:
+                            if "Redundant statements" in reflection:
+                                new_proposal = f"{new_proposal} Avoid redundant statements"
+                            if "Summarization" in reflection:
+                                new_proposal = f"{new_proposal} Summarize effectively"
+
+                        if turn_num < self.max_turn - 1:
+                            logging.info("Re-generating question based on reflection...")
+                            user_utterance = self.wiki_writer(
+                                topic=topic,
+                                proposal=new_proposal,
+                                persona=persona,
+                                dialogue_turns=dlg_history
+                            ).question
+                            if user_utterance != "" and not user_utterance.startswith(
+                                    "Thank you so much for your help!"):
+                                try:
+                                    new_dlg_turn = self.continue_dialogue(topic, new_proposal, persona, dlg_history, user_utterance,
+                                                                        ground_truth_url, callback_handler)
+                                    dlg_history.append(new_dlg_turn)  # 更新 dlg_history
+                                except Exception as e:
+                                    logging.error(f"Error during re - generating dialogue: {str(e)}", exc_info=True)
+
+                except Exception as e:
+                    logging.error(f"Error during reflection: {str(e)}", exc_info=True)
+
+            dlg_history.append(dlg_turn)
+
+        return dspy.Prediction(dlg_history=dlg_history)
