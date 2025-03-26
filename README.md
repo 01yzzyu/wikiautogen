@@ -112,7 +112,15 @@ This project is licensed under the MIT License. Content generation based on Wiki
 
 ## Citation
 ```bibtex
-
+@misc{yang2025wikiautogenmultimodalwikipediastylearticle,
+      title={WikiAutoGen: Towards Multi-Modal Wikipedia-Style Article Generation}, 
+      author={Zhongyu Yang and Jun Chen and Dannong Xu and Junjie Fei and Xiaoqian Shen and Liangbing Zhao and Chun-Mei Feng and Mohamed Elhoseiny},
+      year={2025},
+      eprint={2503.19065},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2503.19065}, 
+}
 ```
 
 ## 👍 Acknowledgement
