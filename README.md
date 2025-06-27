@@ -9,7 +9,7 @@ Zhongyu Yang<sup>1, 2*</sup>, Jun Chen<sup>1*</sup>, Dannong Xu<sup>1,3</sup>, J
 <sup>3</sup>The University of Sydney, 
 <sup>4</sup>IHPC, A*STAR
 
-# 👀 The code is coming soon...
+# 👀 WikiAutoGen has been accepted by ICCV2025...
 
 ## Installation
 
