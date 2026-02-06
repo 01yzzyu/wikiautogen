@@ -11,6 +11,11 @@ Zhongyu Yang<sup>1, 2*</sup>, Jun Chen<sup>1*</sup>, Dannong Xu<sup>1,3</sup>, J
 
 # 👀 WikiAutoGen has been accepted by ICCV2025...
 
+## WIKISEEK Benchmark
+
+The WIKISEEK benchmark is publicly available at:
+[Google Drive](https://drive.google.com/drive/folders/1f_KDv9xh-fVXeCz_iUQv-beopfmAJyoO?usp=sharing)
+
 ## Installation
 
 ```bash
